@@ -36,6 +36,8 @@
   auth:
     build: ./auth_service
     container_name: auth
+    ports:
+      - "8000:8000"
     environment:
       PORT: 8000
       CONSUL_URL: http://consul:8500
