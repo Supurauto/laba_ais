@@ -6,7 +6,7 @@
     ports:
       - "8500:8500"
     healthcheck:
-      test: ["CMD", "consul", "members"]
+      test: [ "CMD", "consul", "members" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -33,6 +33,17 @@
       consul:
         condition: service_healthy
 
+  auth:
+    build: ./auth_service
+    container_name: auth
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: 8000
+      CONSUL_URL: http://consul:8500
+    depends_on:
+      consul:
+        condition: service_healthy
   nginx:
     image: nginx:1.27
     container_name: nginx
