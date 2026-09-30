@@ -6,7 +6,7 @@
     ports:
       - "8500:8500"
     healthcheck:
-      test: ["CMD", "consul", "members"]
+      test: [ "CMD", "consul", "members" ]
       interval: 5s
       timeout: 3s
       retries: 5
