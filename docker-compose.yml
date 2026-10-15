@@ -44,6 +44,20 @@
     depends_on:
       consul:
         condition: service_healthy
+  order:
+    build: ./order_service
+    container_name: order
+
+  graphql:
+    build: ./graphql_gateway
+    container_name: graphql
+    environment:
+      ORDER_URL: http://order:8000
+      CATALOG_URL: http://catalog-1:8000
+    depends_on:
+      - order
+      - catalog-1
+
   nginx:
     image: nginx:1.27
     container_name: nginx
@@ -54,3 +68,6 @@
     depends_on:
       - catalog-1
       - catalog-2
+      - auth
+      - order
+      - graphql
