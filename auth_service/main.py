@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, Field, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import jwt
 from fastapi import FastAPI, HTTPException, Depends
