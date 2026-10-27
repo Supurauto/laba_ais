@@ -44,9 +44,20 @@
     depends_on:
       consul:
         condition: service_healthy
+
   order:
     build: ./order_service
     container_name: order
+    environment:
+      RABBITMQ_URL: amqp://lab:lab@rabbitmq:5672/
+      DATABASE_PATH: /data/orders.db
+    ports:
+      - "8003:8000"
+    volumes:
+      - order_data:/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
   graphql:
     build: ./graphql_gateway
@@ -57,6 +68,40 @@
     depends_on:
       - order
       - catalog-1
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: lab
+      RABBITMQ_DEFAULT_PASS: lab
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  payment:
+    build: ./payment_service
+    environment:
+      RABBITMQ_URL: amqp://lab:lab@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  notification:
+    build: ./notification_service
+    environment:
+      RABBITMQ_URL: amqp://lab:lab@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
   nginx:
     image: nginx:1.27
@@ -71,3 +116,6 @@
       - auth
       - order
       - graphql
+volumes:
+  rabbitmq_data:
+  order_data:
