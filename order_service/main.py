@@ -11,7 +11,11 @@ from uuid import uuid4
 import pika
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-
+from payment_client import (
+    check_payment,
+    close_payment_channel,
+    log_payment_client_settings,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +46,9 @@ class CreateOrder(BaseModel):
     totalAmount: float = Field(gt=0, allow_inf_nan=False)
     simulatePaymentFailure: bool = False
 
+class CheckPaymentInput(BaseModel):
+    amount: float = Field(gt=0, allow_inf_nan=False)
+    simulate_failure: bool = False
 
 def connect_database():
     return sqlite3.connect(DATABASE_PATH, timeout=10)
@@ -348,17 +355,20 @@ async def lifespan(app):
     initialize_database()
     stop_event.clear()
 
+    log_payment_client_settings()
+
     consumer_thread = threading.Thread(
         target=consume_payment_events,
         daemon=True,
     )
     consumer_thread.start()
 
-    yield
-
-    stop_event.set()
-    consumer_thread.join(timeout=5)
-
+    try:
+        yield
+    finally:
+        stop_event.set()
+        consumer_thread.join(timeout=5)
+        close_payment_channel()
 
 app = FastAPI(
     title="BookStore — Order",
@@ -471,3 +481,18 @@ def get_orders(userId: int = Query(..., gt=0)):
         result.append(order)
 
     return result
+
+@app.post(
+    "/check-payment/{order_id}",
+    tags=["Payment check"],
+    summary="Учебная проверка оплаты через gRPC",
+)
+def check_payment_endpoint(
+    order_id: str,
+    data: CheckPaymentInput,
+):
+    return check_payment(
+        order_id=order_id,
+        amount=data.amount,
+        simulate_failure=data.simulate_failure,
+    )

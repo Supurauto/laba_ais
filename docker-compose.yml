@@ -46,11 +46,14 @@
         condition: service_healthy
 
   order:
-    build: ./order_service
+    build:
+      context: .
+      dockerfile: order_service/Dockerfile
     container_name: order
     environment:
       RABBITMQ_URL: amqp://lab:lab@rabbitmq:5672/
       DATABASE_PATH: /data/orders.db
+      PAYMENT_GRPC_ADDRESS: payment:50051
     ports:
       - "8003:8000"
     volumes:
@@ -88,7 +91,9 @@
       start_period: 10s
 
   payment:
-    build: ./payment_service
+    build:
+      context: .
+      dockerfile: payment_service/Dockerfile
     environment:
       RABBITMQ_URL: amqp://lab:lab@rabbitmq:5672/
     depends_on:
