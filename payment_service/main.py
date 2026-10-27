@@ -5,7 +5,7 @@ import time
 from uuid import NAMESPACE_URL, uuid5
 
 import pika
-
+from grpc_server import start_grpc_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -187,4 +187,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    grpc_server = start_grpc_server()
+
+    try:
+        main()
+    finally:
+        grpc_server.stop(grace=5).wait()
