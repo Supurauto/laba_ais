@@ -1,16 +1,25 @@
 ﻿import json
 import logging
-import os
-import sqlite3
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from uuid import uuid4
 
-import pika
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+
+from payment_client import (
+    check_payment,
+    close_payment_channel,
+    log_payment_client_settings,
+)
+from shared import (
+    ORDERS_TOPIC,
+    PAYMENTS_TOPIC,
+    consume,
+    database,
+    publish,
+)
 
 
 logging.basicConfig(
@@ -19,14 +28,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("order")
 
-RABBITMQ_URL = os.getenv(
-    "RABBITMQ_URL",
-    "amqp://lab:lab@rabbitmq:5672/",
-)
-DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/orders.db")
-
-EXCHANGE = "orders.events"
-ORDER_QUEUE = "order.events"
+EVENT_DB = "/data/events.db"
+READ_DB = "/data/order_read.db"
 
 stop_event = threading.Event()
 
@@ -36,333 +39,413 @@ class OrderItem(BaseModel):
     quantity: int = Field(gt=0)
 
 
-class CreateOrder(BaseModel):
+class CreateOrderInput(BaseModel):
     userId: int = Field(gt=0)
     items: list[OrderItem] = Field(min_length=1)
     totalAmount: float = Field(gt=0, allow_inf_nan=False)
+    autoPay: bool = True
     simulatePaymentFailure: bool = False
 
 
-def connect_database():
-    return sqlite3.connect(DATABASE_PATH, timeout=10)
+class CommandInput(BaseModel):
+    expectedVersion: int | None = Field(default=None, ge=1)
 
 
-def initialize_database():
-    Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
-
-    demo_orders = [
-        {
-            "id": "101",
-            "userId": 1,
-            "createdAt": "2026-10-01T10:00:00Z",
-            "items": [
-                {"productId": 1, "quantity": 2},
-                {"productId": 2, "quantity": 1},
-            ],
-            "totalAmount": 1850,
-        },
-        {
-            "id": "102",
-            "userId": 1,
-            "createdAt": "2026-10-02T11:30:00Z",
-            "items": [
-                {"productId": 1, "quantity": 1},
-                {"productId": 3, "quantity": 2},
-            ],
-            "totalAmount": 1350,
-        },
-        {
-            "id": "103",
-            "userId": 2,
-            "createdAt": "2026-10-03T09:15:00Z",
-            "items": [
-                {"productId": 4, "quantity": 1},
-            ],
-            "totalAmount": 450,
-        },
-    ]
-
-    connection = connect_database()
-    try:
-        with connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS orders (
-                    id TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    payload TEXT NOT NULL,
-                    status TEXT NOT NULL
-                        CHECK (status IN (
-                            'PENDING', 'CONFIRMED', 'CANCELLED'
-                        ))
-                )
-                """
-            )
-
-            for order in demo_orders:
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO orders
-                        (id, user_id, payload, status)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        order["id"],
-                        order["userId"],
-                        json.dumps(order, ensure_ascii=False),
-                        "CONFIRMED",
-                    ),
-                )
-    finally:
-        connection.close()
-
-
-def save_order(order):
-    connection = connect_database()
-    try:
-        with connection:
-            connection.execute(
-                """
-                INSERT INTO orders (id, user_id, payload, status)
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    order["id"],
-                    order["userId"],
-                    json.dumps(order, ensure_ascii=False),
-                    "PENDING",
-                ),
-            )
-    finally:
-        connection.close()
-
-
-def read_order(order_id):
-    connection = connect_database()
-    try:
-        row = connection.execute(
-            "SELECT payload, status FROM orders WHERE id = ?",
-            (order_id,),
-        ).fetchone()
-    finally:
-        connection.close()
-
-    if row is None:
-        return None
-
-    order = json.loads(row[0])
-    order["status"] = row[1]
-    return order
-
-
-def change_status(order_id, new_status):
-    connection = connect_database()
-    try:
-        with connection:
-            cursor = connection.execute(
-                """
-                UPDATE orders
-                SET status = ?
-                WHERE id = ? AND status = 'PENDING'
-                """,
-                (new_status, order_id),
-            )
-            return cursor.rowcount == 1
-    finally:
-        connection.close()
-
-
-def open_broker():
-    parameters = pika.URLParameters(RABBITMQ_URL)
-    parameters.heartbeat = 30
-    parameters.blocked_connection_timeout = 10
-    parameters.socket_timeout = 5
-
-    connection = pika.BlockingConnection(parameters)
-    channel = connection.channel()
-
-    channel.exchange_declare(
-        exchange=EXCHANGE,
-        exchange_type="direct",
-        durable=True,
+class CancelInput(CommandInput):
+    reason: str = Field(
+        default="Отмена по запросу клиента",
+        min_length=1,
     )
 
-    bindings = {
-        "payment.events": ["OrderCreated"],
-        "order.events": ["PaymentCompleted", "PaymentFailed"],
-        "notification.events": [
-            "PaymentCompleted",
-            "OrderCancelled",
-        ],
+
+class CheckPaymentInput(BaseModel):
+    amount: float = Field(gt=0, allow_inf_nan=False)
+    simulate_failure: bool = False
+
+
+def initialize_databases():
+    with database(EVENT_DB) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                position INTEGER PRIMARY KEY AUTOINCREMENT,
+                eventId TEXT NOT NULL UNIQUE,
+                orderId TEXT NOT NULL,
+                eventType TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                published INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(orderId, version)
+            )
+            """
+        )
+
+    with database(READ_DB) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_view (
+                order_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                document TEXT NOT NULL
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_order_view_user
+            ON order_view(user_id)
+            """
+        )
+
+
+def row_to_event(row):
+    return {
+        "eventId": row["eventId"],
+        "orderId": row["orderId"],
+        "eventType": row["eventType"],
+        "payload": json.loads(row["payload"]),
+        "timestamp": row["timestamp"],
+        "version": row["version"],
     }
 
-    for queue_name, event_names in bindings.items():
-        channel.queue_declare(queue=queue_name, durable=True)
 
-        for event_name in event_names:
-            channel.queue_bind(
-                exchange=EXCHANGE,
-                queue=queue_name,
-                routing_key=event_name,
-            )
+def load_events(connection, order_id):
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM events
+        WHERE orderId = ?
+        ORDER BY version
+        """,
+        (order_id,),
+    ).fetchall()
 
-    channel.confirm_delivery()
-    return connection, channel
-
-
-def publish_event(channel, event_name, payload):
-    channel.basic_publish(
-        exchange=EXCHANGE,
-        routing_key=event_name,
-        body=json.dumps(
-            payload,
-            ensure_ascii=False,
-        ).encode("utf-8"),
-        properties=pika.BasicProperties(
-            content_type="application/json",
-            delivery_mode=2,
-        ),
-        mandatory=True,
-    )
-
-    logger.info(
-        "Опубликовано %s: %s",
-        event_name,
-        json.dumps(payload, ensure_ascii=False),
-    )
+    return [row_to_event(row) for row in rows]
 
 
-def handle_payment_event(channel, method, properties, body):
-    try:
-        event = json.loads(body)
-        order_id = str(event["orderId"])
-    except (ValueError, KeyError, TypeError):
-        logger.exception("Некорректное сообщение")
-        channel.basic_nack(
-            delivery_tag=method.delivery_tag,
-            requeue=False,
-        )
-        return
+def apply_event(state, event):
+    current_version = 0 if state is None else state["version"]
 
-    event_name = method.routing_key
+    if event["version"] != current_version + 1:
+        raise ValueError("Нарушен порядок версий")
 
-    logger.info(
-        "Получено %s: %s",
-        event_name,
-        json.dumps(event, ensure_ascii=False),
-    )
+    event_type = event["eventType"]
+    payload = event["payload"]
 
-    order = read_order(order_id)
+    if event_type == "OrderCreated":
+        if state is not None:
+            raise ValueError("Повторное создание заказа")
 
-    if order is None:
-        logger.warning("Неизвестный orderId=%s", order_id)
-        channel.basic_ack(delivery_tag=method.delivery_tag)
-        return
+        state = {
+            "id": event["orderId"],
+            "userId": payload["userId"],
+            "items": payload["items"],
+            "totalAmount": payload["totalAmount"],
+            "status": "PENDING",
+            "createdAt": event["timestamp"],
+            "autoPay": payload.get("autoPay", True),
+        }
 
-    if event_name == "PaymentCompleted":
-        changed = change_status(order_id, "CONFIRMED")
+    else:
+        if state is None:
+            raise ValueError("Нет события OrderCreated")
 
-        if changed:
-            logger.info(
-                "orderId=%s: PENDING -> CONFIRMED",
-                order_id,
-            )
+        state = dict(state)
+
+        if event_type == "OrderPaid":
+            state["status"] = "CONFIRMED"
+            state["transactionId"] = payload["transactionId"]
+
+        elif event_type == "OrderCancelled":
+            state["status"] = "CANCELLED"
+            state["cancelReason"] = payload["reason"]
+
         else:
-            logger.info(
-                "orderId=%s: статус не изменён, "
-                "заказ уже завершён",
-                order_id,
+            raise ValueError("Неизвестное событие")
+
+    state["version"] = event["version"]
+    state["updatedAt"] = event["timestamp"]
+
+    return state
+
+
+def rehydrate(events):
+    state = None
+
+    for event in events:
+        state = apply_event(state, event)
+
+    return state
+
+
+def append_event(
+    order_id,
+    event_type,
+    payload,
+    expected_version=None,
+    from_payment=False,
+):
+    with database(EVENT_DB) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        events = load_events(connection, order_id)
+        state = rehydrate(events)
+        version = 0 if state is None else state["version"]
+
+        if from_payment:
+            if state is None or state["status"] != "PENDING":
+                logger.info(
+                    "Результат оплаты проигнорирован: orderId=%s",
+                    order_id,
+                )
+                return None
+
+        if (
+            expected_version is not None
+            and expected_version != version
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Версия устарела. Прочитайте заказ повторно",
             )
 
-    elif event_name == "PaymentFailed":
-        changed = change_status(order_id, "CANCELLED")
+        if event_type == "OrderCreated":
+            if state is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Заказ уже существует",
+                )
 
-        if changed:
-            logger.info(
-                "orderId=%s: PENDING -> CANCELLED; компенсация",
-                order_id,
-            )
         else:
-            logger.info(
-                "orderId=%s: статус повторно не изменён",
-                order_id,
-            )
+            if state is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Заказ не найден",
+                )
 
-        current_order = read_order(order_id)
-
-        if current_order["status"] == "CANCELLED":
-            publish_event(
-                channel,
-                "OrderCancelled",
-                {
-                    "orderId": order_id,
-                    "userId": current_order["userId"],
-                    "reason": event.get(
-                        "reason",
-                        "Оплата отклонена",
-                    ),
-                },
-            )
-
-    channel.basic_ack(delivery_tag=method.delivery_tag)
-
-
-def consume_payment_events():
-    while not stop_event.is_set():
-        connection = None
-
-        try:
-            connection, channel = open_broker()
-            channel.basic_qos(prefetch_count=1)
-
-            channel.basic_consume(
-                queue=ORDER_QUEUE,
-                on_message_callback=handle_payment_event,
-                auto_ack=False,
-            )
-
-            logger.info("Ожидание событий оплаты")
-
-            while not stop_event.is_set():
-                connection.process_data_events(time_limit=1)
-
-        except Exception:
-            logger.exception(
-                "Ошибка потребителя; повторное подключение"
-            )
-
-        finally:
-            if connection is not None and connection.is_open:
-                try:
-                    connection.close()
-                except pika.exceptions.AMQPError:
-                    logger.warning(
-                        "Не удалось корректно закрыть соединение"
+            if event_type == "OrderPaid":
+                if state["status"] != "PENDING":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Оплатить можно только ожидающий заказ",
                     )
 
-        stop_event.wait(3)
+            elif event_type == "OrderCancelled":
+                if state["status"] == "CANCELLED":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Заказ уже отменён",
+                    )
+
+            else:
+                raise ValueError("Неизвестная команда")
+
+        event = {
+            "eventId": str(uuid4()),
+            "orderId": order_id,
+            "eventType": event_type,
+            "payload": payload,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": version + 1,
+        }
+
+        connection.execute(
+            """
+            INSERT INTO events (
+                eventId, orderId, eventType,
+                payload, timestamp, version
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["eventId"],
+                event["orderId"],
+                event["eventType"],
+                json.dumps(payload, ensure_ascii=False),
+                event["timestamp"],
+                event["version"],
+            ),
+        )
+
+        new_state = apply_event(state, event)
+
+    logger.info(
+        "Сохранено %s: orderId=%s, status=%s, version=%s",
+        event_type,
+        order_id,
+        new_state["status"],
+        event["version"],
+    )
+
+    return {
+        "id": order_id,
+        "orderId": order_id,
+        "eventId": event["eventId"],
+        "eventType": event_type,
+        "status": new_state["status"],
+        "version": event["version"],
+    }
+
+
+def relay_events():
+    while not stop_event.is_set():
+        try:
+            with database(EVENT_DB) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM events
+                    WHERE published = 0
+                    ORDER BY position
+                    LIMIT 100
+                    """
+                ).fetchall()
+
+            for row in rows:
+                if stop_event.is_set():
+                    break
+
+                event = row_to_event(row)
+                publish(ORDERS_TOPIC, event)
+
+                with database(EVENT_DB) as connection:
+                    connection.execute(
+                        """
+                        UPDATE events
+                        SET published = 1
+                        WHERE eventId = ?
+                        """,
+                        (event["eventId"],),
+                    )
+
+        except Exception:
+            logger.exception("Ошибка публикации событий")
+
+        stop_event.wait(1)
+
+
+def update_read_model(event):
+    with database(READ_DB) as connection:
+        row = connection.execute(
+            """
+            SELECT document
+            FROM order_view
+            WHERE order_id = ?
+            """,
+            (event["orderId"],),
+        ).fetchone()
+
+        state = None if row is None else json.loads(row["document"])
+
+        if state is not None and event["version"] <= state["version"]:
+            return
+
+        state = apply_event(state, event)
+
+        connection.execute(
+            """
+            INSERT INTO order_view (
+                order_id, user_id, document
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(order_id)
+            DO UPDATE SET
+                user_id = excluded.user_id,
+                document = excluded.document
+            """,
+            (
+                state["id"],
+                state["userId"],
+                json.dumps(state, ensure_ascii=False),
+            ),
+        )
+
+    logger.info(
+        "Read-модель: orderId=%s, status=%s, version=%s",
+        state["id"],
+        state["status"],
+        state["version"],
+    )
+
+
+def handle_payment_result(event):
+    payload = event["payload"]
+
+    if event["eventType"] == "PaymentCompleted":
+        append_event(
+            order_id=event["orderId"],
+            event_type="OrderPaid",
+            payload={
+                "transactionId": payload["transactionId"],
+                "source": "Payment",
+            },
+            from_payment=True,
+        )
+
+    elif event["eventType"] == "PaymentFailed":
+        append_event(
+            order_id=event["orderId"],
+            event_type="OrderCancelled",
+            payload={
+                "reason": payload["reason"],
+                "source": "Payment",
+            },
+            from_payment=True,
+        )
 
 
 @asynccontextmanager
 async def lifespan(app):
-    initialize_database()
+    initialize_databases()
     stop_event.clear()
+    log_payment_client_settings()
 
-    consumer_thread = threading.Thread(
-        target=consume_payment_events,
-        daemon=True,
-    )
-    consumer_thread.start()
+    workers = [
+        threading.Thread(
+            target=relay_events,
+            daemon=True,
+        ),
+        threading.Thread(
+            target=consume,
+            args=(
+                ORDERS_TOPIC,
+                "order-read-model",
+                update_read_model,
+                stop_event,
+            ),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=consume,
+            args=(
+                PAYMENTS_TOPIC,
+                "order-payment-results",
+                handle_payment_result,
+                stop_event,
+            ),
+            daemon=True,
+        ),
+    ]
 
-    yield
+    for worker in workers:
+        worker.start()
 
-    stop_event.set()
-    consumer_thread.join(timeout=5)
+    try:
+        yield
+    finally:
+        stop_event.set()
+
+        for worker in workers:
+            worker.join(timeout=10)
+
+        close_payment_channel()
 
 
 app = FastAPI(
     title="BookStore — Order",
-    version="4.0",
+    version="6.0",
     docs_url="/api/orders/docs",
     openapi_url="/api/orders/openapi.json",
     redoc_url=None,
@@ -370,104 +453,105 @@ app = FastAPI(
 )
 
 
-@app.post("/orders", status_code=201, tags=["Order"])
-def create_order(data: CreateOrder):
-    order_id = str(uuid4())
-    created_at = datetime.now(timezone.utc).isoformat()
-    items = [item.model_dump() for item in data.items]
-
-    order = {
-        "id": order_id,
-        "userId": data.userId,
-        "items": items,
-        "totalAmount": data.totalAmount,
-        "createdAt": created_at,
-    }
-
-    event = {
-        "orderId": order_id,
-        "userId": data.userId,
-        "items": items,
-        "totalAmount": data.totalAmount,
-        "createdAt": created_at,
-        "simulatePaymentFailure": data.simulatePaymentFailure,
-    }
-
-    connection = None
-
-    try:
-        connection, channel = open_broker()
-
-        save_order(order)
-        logger.info(
-            "orderId=%s: заказ сохранён, status=PENDING",
-            order_id,
-        )
-
-        publish_event(channel, "OrderCreated", event)
-
-    except pika.exceptions.AMQPError as error:
-        change_status(order_id, "CANCELLED")
-
-        logger.exception(
-            "orderId=%s: ошибка публикации OrderCreated",
-            order_id,
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "message": "Не удалось передать заказ на оплату",
-                "orderId": order_id,
-            },
-        ) from error
-
-    finally:
-        if connection is not None and connection.is_open:
-            try:
-                connection.close()
-            except pika.exceptions.AMQPError:
-                logger.warning(
-                    "Не удалось корректно закрыть соединение"
-                )
-
-    return {"id": order_id, "status": "PENDING"}
+@app.post("/orders", status_code=201, tags=["Commands"])
+def create_order(data: CreateOrderInput):
+    return append_event(
+        order_id=str(uuid4()),
+        event_type="OrderCreated",
+        payload=data.model_dump(),
+    )
 
 
-@app.get("/orders/{order_id}", tags=["Order"])
+@app.post("/orders/{order_id}/pay", tags=["Commands"])
+def pay_order(order_id: str, data: CommandInput):
+    return append_event(
+        order_id=order_id,
+        event_type="OrderPaid",
+        payload={
+            "transactionId": str(uuid4()),
+            "source": "ManualCommand",
+        },
+        expected_version=data.expectedVersion,
+    )
+
+
+@app.post("/orders/{order_id}/cancel", tags=["Commands"])
+def cancel_order(order_id: str, data: CancelInput):
+    return append_event(
+        order_id=order_id,
+        event_type="OrderCancelled",
+        payload={
+            "reason": data.reason,
+            "source": "ManualCommand",
+        },
+        expected_version=data.expectedVersion,
+    )
+
+
+@app.get("/orders/{order_id}", tags=["Queries"])
 def get_order(order_id: str):
-    order = read_order(order_id)
+    with database(READ_DB) as connection:
+        row = connection.execute(
+            """
+            SELECT document
+            FROM order_view
+            WHERE order_id = ?
+            """,
+            (order_id,),
+        ).fetchone()
 
-    if order is None:
+    if row is None:
         raise HTTPException(
             status_code=404,
-            detail="Заказ не найден",
+            detail="Заказ отсутствует в read-модели",
         )
 
-    return order
+    return json.loads(row["document"])
 
 
-@app.get("/api/orders", tags=["Order"])
+@app.get("/api/orders", tags=["Queries"])
 def get_orders(userId: int = Query(..., gt=0)):
-    connection = connect_database()
-    try:
+    with database(READ_DB) as connection:
         rows = connection.execute(
             """
-            SELECT payload, status
-            FROM orders
+            SELECT document
+            FROM order_view
             WHERE user_id = ?
             ORDER BY rowid
             """,
             (userId,),
         ).fetchall()
-    finally:
-        connection.close()
 
-    result = []
+    return [json.loads(row["document"]) for row in rows]
 
-    for payload, status in rows:
-        order = json.loads(payload)
-        order["status"] = status
-        result.append(order)
 
-    return result
+@app.get("/debug/orders/{order_id}/events", tags=["Debug"])
+def inspect_events(order_id: str):
+    with database(EVENT_DB) as connection:
+        events = load_events(connection, order_id)
+
+    if not events:
+        raise HTTPException(
+            status_code=404,
+            detail="События не найдены",
+        )
+
+    return {
+        "events": events,
+        "rehydratedState": rehydrate(events),
+    }
+
+
+@app.post(
+    "/check-payment/{order_id}",
+    tags=["Payment check"],
+)
+def check_payment_endpoint(
+    order_id: str,
+    data: CheckPaymentInput,
+):
+    return check_payment(
+        order_id=order_id,
+        amount=data.amount,
+        simulate_failure=data.simulate_failure,
+    )
