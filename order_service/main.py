@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-
 from payment_client import (
     check_payment,
     close_payment_channel,
@@ -46,6 +45,9 @@ class CreateOrderInput(BaseModel):
     autoPay: bool = True
     simulatePaymentFailure: bool = False
 
+class CheckPaymentInput(BaseModel):
+    amount: float = Field(gt=0, allow_inf_nan=False)
+    simulate_failure: bool = False
 
 class CommandInput(BaseModel):
     expectedVersion: int | None = Field(default=None, ge=1)
