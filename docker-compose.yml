@@ -80,15 +80,35 @@
       kafka:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
-    command: |
-      set -e
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic orders-events --partitions 1 --replication-factor 1 --config retention.ms=-1
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic payment-results --partitions 1 --replication-factor 1 --config retention.ms=-1
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic orders-events \
+          --partitions 1 \
+          --replication-factor 1 \
+          --config retention.ms=-1
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic payment-results \
+          --partitions 1 \
+          --replication-factor 1 \
+          --config retention.ms=-1
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --list
 
   kafka-ui:
     image: provectuslabs/kafka-ui:v0.7.2
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8081:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: bookstore
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092

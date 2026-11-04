@@ -13,6 +13,7 @@ RUN python -m grpc_tools.protoc \
     --grpc_python_out=. \
     ./proto/payment.proto
 
+COPY shared.py .
 COPY payment_service/main.py .
 COPY payment_service/grpc_server.py .
 

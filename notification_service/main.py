@@ -1,9 +1,7 @@
-﻿import json
-import logging
-import os
-import time
+﻿import logging
+import threading
 
-import pika
+from shared import ORDERS_TOPIC, consume, database
 
 
 logging.basicConfig(
@@ -12,121 +10,75 @@ logging.basicConfig(
 )
 logger = logging.getLogger("notification")
 
-RABBITMQ_URL = os.getenv(
-    "RABBITMQ_URL",
-    "amqp://lab:lab@rabbitmq:5672/",
-)
-
-EXCHANGE = "orders.events"
-QUEUE = "notification.events"
+DATABASE_PATH = "/data/notifications.db"
+stop_event = threading.Event()
 
 
-def open_broker():
-    parameters = pika.URLParameters(RABBITMQ_URL)
-    parameters.heartbeat = 30
-    parameters.blocked_connection_timeout = 10
-    parameters.socket_timeout = 5
-
-    connection = pika.BlockingConnection(parameters)
-    channel = connection.channel()
-
-    channel.exchange_declare(
-        exchange=EXCHANGE,
-        exchange_type="direct",
-        durable=True,
-    )
-
-    channel.queue_declare(
-        queue=QUEUE,
-        durable=True,
-    )
-
-    for event_name in ("PaymentCompleted", "OrderCancelled"):
-        channel.queue_bind(
-            exchange=EXCHANGE,
-            queue=QUEUE,
-            routing_key=event_name,
+def initialize_database():
+    with database(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_events (
+                event_id TEXT PRIMARY KEY
+            )
+            """
         )
 
-    return connection, channel
 
+def handle_order_event(event):
+    event_type = event["eventType"]
 
-def handle_notification(channel, method, properties, body):
-    try:
-        event = json.loads(body)
-        order_id = str(event["orderId"])
-    except (ValueError, KeyError, TypeError):
-        logger.exception("Некорректное сообщение")
-        channel.basic_nack(
-            delivery_tag=method.delivery_tag,
-            requeue=False,
-        )
+    if event_type not in ("OrderPaid", "OrderCancelled"):
         return
 
-    event_name = method.routing_key
+    with database(DATABASE_PATH) as connection:
+        row = connection.execute(
+            """
+            SELECT event_id
+            FROM processed_events
+            WHERE event_id = ?
+            """,
+            (event["eventId"],),
+        ).fetchone()
 
-    logger.info(
-        "Получено %s: %s",
-        event_name,
-        json.dumps(event, ensure_ascii=False),
-    )
+        if row is not None:
+            return
 
-    if event_name == "PaymentCompleted":
-        logger.info(
-            "Отправлено уведомление клиенту: "
-            "заказ %s оплачен",
-            order_id,
-        )
-
-    elif event_name == "OrderCancelled":
-        logger.info(
-            "Отправлено уведомление клиенту: "
-            "заказ %s отменён. Причина: %s",
-            order_id,
-            event.get("reason", "Не указана"),
-        )
-
-    channel.basic_ack(delivery_tag=method.delivery_tag)
-
-
-def main():
-    while True:
-        connection = None
-
-        try:
-            connection, channel = open_broker()
-            channel.basic_qos(prefetch_count=1)
-
-            channel.basic_consume(
-                queue=QUEUE,
-                on_message_callback=handle_notification,
-                auto_ack=False,
-            )
-
+        if event_type == "OrderPaid":
             logger.info(
-                "Ожидание PaymentCompleted и OrderCancelled"
-            )
-            channel.start_consuming()
-
-        except KeyboardInterrupt:
-            break
-
-        except Exception:
-            logger.exception(
-                "Ошибка потребителя; повторное подключение"
+                "Отправлено уведомление клиенту: "
+                "заказ %s оплачен",
+                event["orderId"],
             )
 
-        finally:
-            if connection is not None and connection.is_open:
-                try:
-                    connection.close()
-                except pika.exceptions.AMQPError:
-                    logger.warning(
-                        "Не удалось корректно закрыть соединение"
-                    )
+        else:
+            logger.info(
+                "Отправлено уведомление клиенту: "
+                "заказ %s отменён. Причина: %s",
+                event["orderId"],
+                event["payload"]["reason"],
+            )
 
-        time.sleep(3)
+        connection.execute(
+            """
+            INSERT INTO processed_events (event_id)
+            VALUES (?)
+            """,
+            (event["eventId"],),
+        )
 
 
 if __name__ == "__main__":
-    main()
+    initialize_database()
+
+    try:
+        consume(
+            ORDERS_TOPIC,
+            "notification-orders",
+            handle_order_event,
+            stop_event,
+        )
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
