@@ -20,6 +20,8 @@
     depends_on:
       consul:
         condition: service_healthy
+    volumes:
+      - catalog_data:/data
 
   catalog-2:
     build: ./catalog_service
@@ -31,15 +33,18 @@
     depends_on:
       consul:
         condition: service_healthy
+    volumes:
+      - catalog_data:/data
 
   auth:
     build: ./auth_service
     container_name: auth
-    ports:
-      - "8000:8000"
     environment:
       PORT: 8000
       CONSUL_URL: http://consul:8500
+      JWT_SECRET: ${JWT_SECRET:?Укажите JWT_SECRET в .env}
+    volumes:
+      - auth_data:/data
     depends_on:
       consul:
         condition: service_healthy
@@ -124,8 +129,6 @@
     environment:
       KAFKA_ADDRESS: kafka:9092
       PAYMENT_GRPC_ADDRESS: payment:50051
-    ports:
-      - "8003:8000"
     volumes:
       - order_data:/data
     depends_on:
@@ -160,8 +163,6 @@
       dockerfile: analytics_service/Dockerfile
     environment:
       KAFKA_ADDRESS: kafka:9092
-    ports:
-      - "8007:8000"
     volumes:
       - analytics_data:/data
     depends_on:
@@ -177,24 +178,34 @@
     depends_on:
       - order
       - catalog-1
-
   nginx:
     image: nginx:1.27
     container_name: nginx
     ports:
-      - "80:80"
+      - "127.0.0.1:80:80"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
+      - api-gateway
       - catalog-1
       - catalog-2
+
+  api-gateway:
+    build: ./api_gateway
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Укажите JWT_SECRET в .env}
+    depends_on:
       - auth
       - order
       - analytics
       - graphql
-
+      - catalog-1
+      - catalog-2
 volumes:
   order_data:
   kafka_data:
   notification_data:
   analytics_data:
+  auth_data:
+  catalog_data:
+

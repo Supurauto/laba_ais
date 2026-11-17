@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-passlib
 PyJWT
+argon2-cffi
 email-validator
