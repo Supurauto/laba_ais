@@ -113,8 +113,8 @@ def require_admin(x_user_role: str | None = Header(default=None)):
             detail="Операция доступна только администратору",
         )
 
-@app.post("/products", include_in_schema=False, status_code=201, dependencies=[Depends(require_admin)])
-@app.post("/api/catalog/products", response_model=Product, status_code=201, tags=["Catalog"], summary="Добавить книгу", dependencies=[Depends(require_admin)])
+@app.post("/products", include_in_schema=False, status_code=200, dependencies=[Depends(require_admin)])
+@app.post("/api/catalog/products", response_model=Product, status_code=200, tags=["Catalog"], summary="Добавить книгу", dependencies=[Depends(require_admin)])
 async def create_product(product: ProductInput):
     global next_product_id
     item = {**product.model_dump(), "id": next_product_id}
