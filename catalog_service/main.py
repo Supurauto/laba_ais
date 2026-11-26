@@ -4,7 +4,7 @@ import time
 from contextlib import asynccontextmanager
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -106,8 +106,15 @@ def get_product(product_id: int):
             return product
     raise HTTPException(status_code=404, detail="Книга не найдена")
 
-@app.post("/products", include_in_schema=False, status_code=201)
-@app.post("/api/catalog/products", response_model=Product, status_code=201, tags=["Catalog"], summary="Добавить книгу")
+def require_admin(x_user_role: str | None = Header(default=None)):
+    if x_user_role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Операция доступна только администратору",
+        )
+
+@app.post("/products", include_in_schema=False, status_code=201, dependencies=[Depends(require_admin)])
+@app.post("/api/catalog/products", response_model=Product, status_code=201, tags=["Catalog"], summary="Добавить книгу", dependencies=[Depends(require_admin)])
 async def create_product(product: ProductInput):
     global next_product_id
     item = {**product.model_dump(), "id": next_product_id}
@@ -123,9 +130,9 @@ async def update_product(product_id: int, product: ProductInput):
     item.update(product.model_dump())
     return item
 
-@app.delete("/products/{product_id}", include_in_schema=False)
+@app.delete("/products/{product_id}", include_in_schema=False, dependencies=[Depends(require_admin)])
 @app.delete("/api/catalog/products/{product_id}", tags=["Catalog"], summary="Удалить книгу",
-            responses={404: {"description": "Книга не найдена"}})
+            responses={404: {"description": "Книга не найдена"}}, dependencies=[Depends(require_admin)])
 async def delete_product(product_id: int):
     products.remove(get_product(product_id))
     return {"message": "Книга удалена"}

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from pydantic import BaseModel, Field
 from payment_client import (
     check_payment,
@@ -456,13 +456,21 @@ app = FastAPI(
 
 
 @app.post("/orders", status_code=201, tags=["Commands"])
-def create_order(data: CreateOrderInput):
+def create_order(
+    data: CreateOrderInput,
+    x_user_role: str | None = Header(default=None),
+):
+    if x_user_role not in ("user", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Создание заказа доступно только пользователю или администратору",
+        )
+
     return append_event(
         order_id=str(uuid4()),
         event_type="OrderCreated",
         payload=data.model_dump(),
     )
-
 
 @app.post("/orders/{order_id}/pay", tags=["Commands"])
 def pay_order(order_id: str, data: CommandInput):
